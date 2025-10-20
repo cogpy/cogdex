@@ -1058,7 +1058,7 @@ dependencies = [
  "codex-rmcp-client",
  "codex-utils-pty",
  "codex-utils-string",
- "core-foundation 0.9.4",
+ "core-foundation 0.10.1",
  "core_test_support",
  "dirs",
  "dunce",
