@@ -137,6 +137,7 @@ pub(crate) struct CodexMessageProcessor {
     // Queue of pending interrupt requests per conversation. We reply when TurnAborted arrives.
     pending_interrupts: Arc<Mutex<HashMap<ConversationId, Vec<RequestId>>>>,
     pending_fuzzy_searches: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    latest_rate_limits: Arc<Mutex<HashMap<ConversationId, RateLimitSnapshot>>>,
 }
 
 impl CodexMessageProcessor {
@@ -157,6 +158,7 @@ impl CodexMessageProcessor {
             active_login: Arc::new(Mutex::new(None)),
             pending_interrupts: Arc::new(Mutex::new(HashMap::new())),
             pending_fuzzy_searches: Arc::new(Mutex::new(HashMap::new())),
+            latest_rate_limits: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1257,6 +1259,7 @@ impl CodexMessageProcessor {
             .insert(subscription_id, cancel_tx);
         let outgoing_for_task = self.outgoing.clone();
         let pending_interrupts = self.pending_interrupts.clone();
+        let latest_rate_limits = self.latest_rate_limits.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -1298,6 +1301,7 @@ impl CodexMessageProcessor {
                         .await;
 
                         apply_bespoke_event_handling(event.clone(), conversation_id, conversation.clone(), outgoing_for_task.clone(), pending_interrupts.clone()).await;
+                        apply_rate_limit_notification(event, conversation_id, outgoing_for_task.clone(), latest_rate_limits.clone()).await;
                     }
                 }
             }
@@ -1463,6 +1467,38 @@ async fn apply_bespoke_event_handling(
         }
 
         _ => {}
+    }
+}
+
+async fn apply_rate_limit_notification(
+    event: Event,
+    conversation_id: ConversationId,
+    outgoing: Arc<OutgoingMessageSender>,
+    latest_rate_limits: Arc<Mutex<HashMap<ConversationId, RateLimitSnapshot>>>,
+) {
+    let Event { msg, .. } = event;
+    let EventMsg::TokenCount(token_count) = msg else {
+        return;
+    };
+    let Some(snapshot) = token_count.rate_limits else {
+        return;
+    };
+
+    // Only notify when the snapshot changes to avoid redundant traffic.
+    let should_send = {
+        let mut map = latest_rate_limits.lock().await;
+        if map.get(&conversation_id) != Some(&snapshot) {
+            map.insert(conversation_id, snapshot.clone());
+            true
+        } else {
+            false
+        }
+    };
+
+    if should_send {
+        outgoing
+            .send_server_notification(ServerNotification::AccountRateLimitsUpdated(snapshot))
+            .await;
     }
 }
 
@@ -1633,9 +1669,18 @@ fn extract_conversation_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context as _;
     use anyhow::Result;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    use crate::outgoing_message::OutgoingMessage;
+    use codex_protocol::protocol::RateLimitWindow;
+    use codex_protocol::protocol::TokenCountEvent;
 
     #[test]
     fn extract_conversation_summary_prefers_plain_user_messages() -> Result<()> {
@@ -1679,6 +1724,93 @@ mod tests {
         );
         assert_eq!(summary.path, path);
         assert_eq!(summary.preview, "Count to 5");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_rate_limit_notification_emits_on_change_only() -> Result<()> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let latest_rate_limits = Arc::new(Mutex::new(HashMap::new()));
+        let conversation_id = ConversationId::new();
+
+        let snapshot_one = RateLimitSnapshot {
+            primary: Some(RateLimitWindow {
+                used_percent: 10.0,
+                window_minutes: Some(60),
+                resets_at: Some(1_111),
+            }),
+            secondary: None,
+        };
+        let event_one = Event {
+            id: "evt-1".to_string(),
+            msg: EventMsg::TokenCount(TokenCountEvent {
+                info: None,
+                rate_limits: Some(snapshot_one.clone()),
+            }),
+        };
+
+        apply_rate_limit_notification(
+            event_one,
+            conversation_id,
+            outgoing.clone(),
+            latest_rate_limits.clone(),
+        )
+        .await;
+
+        let message = rx.recv().await.context("receive first notification")?;
+        match message {
+            OutgoingMessage::AppServerNotification(
+                ServerNotification::AccountRateLimitsUpdated(received),
+            ) => assert_eq!(received, snapshot_one),
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        let event_dup = Event {
+            id: "evt-2".to_string(),
+            msg: EventMsg::TokenCount(TokenCountEvent {
+                info: None,
+                rate_limits: Some(snapshot_one.clone()),
+            }),
+        };
+
+        apply_rate_limit_notification(
+            event_dup,
+            conversation_id,
+            outgoing.clone(),
+            latest_rate_limits.clone(),
+        )
+        .await;
+
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        let snapshot_two = RateLimitSnapshot {
+            primary: Some(RateLimitWindow {
+                used_percent: 20.0,
+                window_minutes: Some(120),
+                resets_at: Some(2_222),
+            }),
+            secondary: None,
+        };
+        let event_two = Event {
+            id: "evt-3".to_string(),
+            msg: EventMsg::TokenCount(TokenCountEvent {
+                info: None,
+                rate_limits: Some(snapshot_two.clone()),
+            }),
+        };
+
+        apply_rate_limit_notification(event_two, conversation_id, outgoing, latest_rate_limits)
+            .await;
+
+        let message = rx.recv().await.context("receive second notification")?;
+        match message {
+            OutgoingMessage::AppServerNotification(
+                ServerNotification::AccountRateLimitsUpdated(received),
+            ) => assert_eq!(received, snapshot_two),
+            other => panic!("unexpected message: {other:?}"),
+        }
+
         Ok(())
     }
 }
