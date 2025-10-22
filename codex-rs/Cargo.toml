@@ -24,6 +24,7 @@ members = [
     "mcp-server",
     "mcp-types",
     "ollama",
+    "opencog-orchestrator",
     "process-hardening",
     "protocol",
     "protocol-ts",
@@ -70,6 +71,7 @@ codex-login = { path = "login" }
 codex-mcp-client = { path = "mcp-client" }
 codex-mcp-server = { path = "mcp-server" }
 codex-ollama = { path = "ollama" }
+codex-opencog-orchestrator = { path = "opencog-orchestrator" }
 codex-otel = { path = "otel" }
 codex-process-hardening = { path = "process-hardening" }
 codex-protocol = { path = "protocol" }

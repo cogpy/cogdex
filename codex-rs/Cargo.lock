@@ -1306,6 +1306,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-opencog-orchestrator"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "async-trait",
+ "chrono",
+ "codex-core",
+ "codex-protocol",
+ "futures",
+ "indexmap 2.10.0",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.16",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "codex-otel"
 version = "0.0.0"
 dependencies = [
